@@ -294,7 +294,19 @@ def start_background_scanner():
 
 # Запускаем фоновый процесс сразу при импорте модуля WSGI-сервером
 start_background_scanner()
-
+@app.route('/test_signal', methods=['GET', 'POST'])
+def trigger_test_signal():
+    global latest_signal
+    latest_signal = {
+        "status": "NEW",
+        "action": "BUY",
+        "symbol": "XAUUSD",
+        "entry": 2650.00,
+        "sl": 2640.00,
+        "tp": 2670.00,
+        "timestamp": int(time.time())
+    }
+    return jsonify({"message": "Тестовый сигнал создан!", "signal": latest_signal}), 200
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 10000))
     app.run(host='0.0.0.0', port=port)
