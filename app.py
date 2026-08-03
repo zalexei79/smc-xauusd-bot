@@ -1,55 +1,88 @@
 import os
 import time
-import threading
-from datetime import datetime, timezone
-from flask import Flask, jsonify, request
 import requests
+import threading
 import pandas as pd
 import numpy as np
 import yfinance as yf
+from flask import Flask, jsonify, request
+from datetime import datetime, timezone
+
+# ------------------------------------------------------------------
+# CONFIGURATION & ENVIRONMENT VARIABLES
+# ------------------------------------------------------------------
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "8874872969:AAHtxvHw_mupom466pm3jh4BkZEjEAQ180A")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "@XauProBot")
+
+YAHOO_TICKER = "GC=F"
+FUTURES_SPOT_OFFSET = 5.4  # Коррекция цен GC=F под спот XAUUSD
+
+# Параметры риск-менеджмента для Gold (XAUUSD)
+RISK_REWARD_RATIO = 2.0
+MIN_SL_DIST = 5.0   # Минимальный Стоп-Лосс ($5)
+MAX_SL_DIST = 10.0  # Максимальный Стоп-Лосс ($10)
+MIN_TP_DIST = 12.0  # Минимальный Тейк-Профит ($12)
+MAX_TP_DIST = 40.0  # Максимальный Тейк-Профит ($40)
 
 app = Flask(__name__)
 
-# --- НАСТРОЙКИ СИСТЕМЫ И TELEGRAM ---
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "8874872969:AAHtxvHw_mupom466pm3jh4BkZEjEAQ180A")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "@XauProBot")
-YAHOO_TICKER = "GC=F"
-FUTURES_SPOT_OFFSET = 5.4
-
-# Память для защиты от повторной отправки одинаковых сигналов в TG
-last_sent_signal = {"buy_entry": 0.0, "sell_entry": 0.0}
-
-# Глобальное состояние сигнала для REST API (cTrader)
+# Глобальное хранилище текущего сигнала для cTrader
 latest_signal = {
     "symbol": "XAUUSD",
-    "action": "",
-    "entry": 0.0,
+    "signal": "NONE",
+    "entry_price": 0.0,
     "sl": 0.0,
     "tp": 0.0,
-    "status": "NONE",
-    "timestamp": 0
+    "timestamp": None,
+    "status": "NONE"
 }
 
-lock = threading.Lock()
-
-# --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
-def is_market_open():
-    """Проверяет, открыт ли рынок (Пн-Пт)."""
-    now = datetime.now(timezone.utc)
-    weekday = now.weekday()  # 0 - Пн, 6 - Вс
-    return weekday < 5
-
-def get_market_data():
-    """Загрузка данных H1 (тренд) и M15 (структура) с таймаутом"""
+# ------------------------------------------------------------------
+# TELEGRAM NOTIFIER
+# ------------------------------------------------------------------
+def send_telegram(text):
+    """Отправка сообщений в Telegram канал"""
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": text,
+        "parse_mode": "HTML"
+    }
     try:
-        gold = yf.Ticker(YAHOO_TICKER)
-        df_h1 = gold.history(period="7d", interval="1h", timeout=15)
-        df_m15 = gold.history(period="3d", interval="15m", timeout=15)
+        res = requests.post(url, json=payload, timeout=10)
+        if res.status_code == 200:
+            print("[+] Сигнал успешно отправлен в Telegram!")
+        else:
+            print(f"[-] Ошибка отправки в Telegram: {res.text}")
+    except Exception as e:
+        print(f"[-] Исключение при отправке в Telegram: {e}")
+
+# ------------------------------------------------------------------
+# DATA FETCHING (YAHOO FINANCE RATE-LIMIT BYPASS)
+# ------------------------------------------------------------------
+def get_market_data():
+    """Загрузка данных H1 и M15 с защитой от блокировок Yahoo Finance (429 Rate Limit)"""
+    try:
+        session = requests.Session()
+        session.headers.update({
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+        })
+
+        # Запрашиваем минимальный период для ускорения отклика
+        df_h1 = yf.download(YAHOO_TICKER, period="5d", interval="1h", progress=False, session=session)
+        df_m15 = yf.download(YAHOO_TICKER, period="2d", interval="15m", progress=False, session=session)
         
         if df_h1.empty or df_m15.empty:
             print("[-] [WARNING] Yahoo вернул пустые данные. Пропуск итерации...")
             return None, None
+
+        # Разворачиваем MultiIndex если yfinance вернул вложенные колонки
+        if isinstance(df_h1.columns, pd.MultiIndex):
+            df_h1.columns = df_h1.columns.get_level_values(0)
+        if isinstance(df_m15.columns, pd.MultiIndex):
+            df_m15.columns = df_m15.columns.get_level_values(0)
             
+        # Корректировка цен с фьючерса на спот XAUUSD
         for df in [df_h1, df_m15]:
             df['High'] -= FUTURES_SPOT_OFFSET
             df['Low'] -= FUTURES_SPOT_OFFSET
@@ -61,276 +94,180 @@ def get_market_data():
         print(f"[-] Ошибка загрузки данных Yahoo: {e}")
         return None, None
 
-def determine_h1_trend(df_h1):
-    """Определение тренда на H1 с помощью скользящих средних"""
-    df_h1['EMA50'] = df_h1['Close'].ewm(span=50, adjust=False).mean()
-    df_h1['EMA200'] = df_h1['Close'].ewm(span=200, adjust=False).mean()
-    
-    last_close = df_h1['Close'].iloc[-1]
-    ema50 = df_h1['EMA50'].iloc[-1]
-    ema200 = df_h1['EMA200'].iloc[-1]
-    
-    if last_close > ema50 and ema50 > ema200:
-        return "BULLISH"
-    elif last_close < ema50 and ema50 < ema200:
-        return "BEARISH"
-    return "SIDEWAYS"
-
-def send_telegram(text):
-    """Отправка сообщения в Telegram канал с таймаутом"""
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        return
-    try: 
-        requests.post(
-            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", 
-            json={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "Markdown"},
-            timeout=10
-        )
-        print("[+] Сигнал успешно отправлен в Telegram!")
-    except Exception as e:
-        print(f"[-] Ошибка отправки в Telegram: {e}")
-
-def validate_and_adjust_signal(action, entry_price, raw_sl, raw_tp):
-    """Корректирует SL ($5-$10) и TP ($12-$40) под реальную волатильность Золота (XAUUSD)."""
-    MIN_SL_DOLLARS = 5.0
-    MAX_SL_DOLLARS = 10.0
-    MIN_TP_DOLLARS = 12.0
-    MAX_TP_DOLLARS = 40.0
-
-    if action == "BUY":
-        sl_dist = entry_price - raw_sl
-        tp_dist = raw_tp - entry_price
-
-        if sl_dist < MIN_SL_DOLLARS:
-            adjusted_sl = entry_price - MIN_SL_DOLLARS
-        elif sl_dist > MAX_SL_DOLLARS:
-            adjusted_sl = entry_price - MAX_SL_DOLLARS
-        else:
-            adjusted_sl = raw_sl
-
-        if tp_dist < MIN_TP_DOLLARS:
-            adjusted_tp = entry_price + MIN_TP_DOLLARS
-        elif tp_dist > MAX_TP_DOLLARS:
-            adjusted_tp = entry_price + MAX_TP_DOLLARS
-        else:
-            adjusted_tp = raw_tp
-
-    elif action == "SELL":
-        sl_dist = raw_sl - entry_price
-        tp_dist = entry_price - raw_tp
-
-        if sl_dist < MIN_SL_DOLLARS:
-            adjusted_sl = entry_price + MIN_SL_DOLLARS
-        elif sl_dist > MAX_SL_DOLLARS:
-            adjusted_sl = entry_price + MAX_SL_DOLLARS
-        else:
-            adjusted_sl = raw_sl
-
-        if tp_dist < MIN_TP_DOLLARS:
-            adjusted_tp = entry_price - MIN_TP_DOLLARS
-        elif tp_dist > MAX_TP_DOLLARS:
-            adjusted_tp = entry_price - MAX_TP_DOLLARS
-        else:
-            adjusted_tp = raw_tp
-    else:
-        return None, None, None
-
-    return round(entry_price, 2), round(adjusted_sl, 2), round(adjusted_tp, 2)
-
-def update_api_signal(action, entry, sl, tp):
-    """Обновляет состояние API моста для передачи сигнала в cTrader"""
+# ------------------------------------------------------------------
+# SMC TREND SWEEP STRATEGY LOGIC
+# ------------------------------------------------------------------
+def analyze_smart_money_trend_sweep():
+    """Анализ рынка по алгоритму SMC Trend Sweep для Gold"""
     global latest_signal
-    with lock:
-        latest_signal = {
-            "symbol": "XAUUSD",
-            "action": action,
-            "entry": float(entry),
-            "sl": float(sl),
-            "tp": float(tp),
-            "status": "NEW",
-            "timestamp": int(time.time())
-        }
-    print(f"✅ Новый сигнал по Gold зафиксирован для cTrader: {action} @ {entry}")
-
-def send_startup_analytics():
-    """Отправляет стартовую аналитику при запуске сервера"""
-    print("[+] [STARTUP] Генерация стартового сигнала аналитики...")
+    
     df_h1, df_m15 = get_market_data()
     if df_h1 is None or df_m15 is None:
         return
 
-    current_price = round(float(df_m15['Close'].iloc[-1]), 2)
-    trend = determine_h1_trend(df_h1)
+    # 1. Определение H1 Тренда
+    h1_close = df_h1['Close'].iloc[-1]
+    h1_sma = df_h1['Close'].rolling(window=20).mean().iloc[-1]
+    h1_trend = "BULLISH" if h1_close > h1_sma else "BEARISH"
+
+    # 2. Поиск Liquidity Sweep на M15 (последние 20 свечей)
+    recent_m15 = df_m15.iloc[-20:-1]
+    last_candle = df_m15.iloc[-1]
     
-    if trend == "BEARISH":
-        action = "SELL"
-        entry_price = round(current_price + 6.0, 2)
-        raw_sl = entry_price + 6.0
-        raw_tp = entry_price - 20.0
+    swing_high = recent_m15['High'].max()
+    swing_low = recent_m15['Low'].min()
+    
+    current_price = round(float(last_candle['Close']), 2)
+    signal_type = "NONE"
+    sl, tp = 0.0, 0.0
+
+    # Покупка: Бычий тренд + Снятие лоев (Liquidity Sweep Low)
+    if h1_trend == "BULLISH" and last_candle['Low'] < swing_low and last_candle['Close'] > swing_low:
+        signal_type = "BUY"
+        raw_sl_dist = current_price - float(last_candle['Low'])
+        sl_dist = max(MIN_SL_DIST, min(raw_sl_dist + 1.0, MAX_SL_DIST))
+        tp_dist = max(MIN_TP_DIST, min(sl_dist * RISK_REWARD_RATIO, MAX_TP_DIST))
+        
+        sl = round(current_price - sl_dist, 2)
+        tp = round(current_price + tp_dist, 2)
+
+    # Продажа: Медвежий тренд + Снятие хаев (Liquidity Sweep High)
+    elif h1_trend == "BEARISH" and last_candle['High'] > swing_high and last_candle['Close'] < swing_high:
+        signal_type = "SELL"
+        raw_sl_dist = float(last_candle['High']) - current_price
+        sl_dist = max(MIN_SL_DIST, min(raw_sl_dist + 1.0, MAX_SL_DIST))
+        tp_dist = max(MIN_TP_DIST, min(sl_dist * RISK_REWARD_RATIO, MAX_TP_DIST))
+        
+        sl = round(current_price + sl_dist, 2)
+        tp = round(current_price - tp_dist, 2)
+
+    # Если сгенерирован новый сигнал
+    if signal_type != "NONE":
+        latest_signal = {
+            "symbol": "XAUUSD",
+            "signal": signal_type,
+            "entry_price": current_price,
+            "sl": sl,
+            "tp": tp,
+            "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
+            "status": "NEW"
+        }
+        
+        # Отправка в Telegram
+        msg = (
+            f"⚡ <b>GOLD SMC TREND SWEEP SIGNAL</b> ⚡\n\n"
+            f"<b>Инструмент:</b> XAUUSD\n"
+            f"<b>Тип:</b> {signal_type}\n"
+            f"<b>Вход:</b> {current_price}\n"
+            f"<b>SL:</b> {sl}\n"
+            f"<b>TP:</b> {tp}\n"
+            f"<b>Время:</b> {latest_signal['timestamp']}"
+        )
+        send_telegram(msg)
+
+# ------------------------------------------------------------------
+# STARTUP TEST ANALYTICS SIGNAL
+# ------------------------------------------------------------------
+def send_startup_analytics():
+    """Стартовый сигнал при перезапуске сервера для проверки связки с cTrader/Telegram"""
+    global latest_signal
+    df_h1, df_m15 = get_market_data()
+    
+    if df_m15 is not None and not df_m15.empty:
+        current_price = round(float(df_m15['Close'].iloc[-1]), 2)
     else:
-        action = "BUY"
-        entry_price = round(current_price - 6.0, 2)
-        raw_sl = entry_price - 6.0
-        raw_tp = entry_price + 20.0
-
-    entry, sl, tp = validate_and_adjust_signal(action, entry_price, raw_sl, raw_tp)
-    if not entry:
-        return
-
-    icon = "🟢 BUY (ПО ТРЕНДУ)" if action == "BUY" else "🔴 SELL (ПО ТРЕНДУ)"
-    text = (
-        f"⚡ **SMART MONEY SWEEP** (СТАРТОВАЯ АНАЛИТИКА)\n"
-        f"🎯 Направление: **{icon}**\n"
-        f"-----------------------------------------\n"
-        f"📍 Вход: **{entry}**\n"
-        f"🛡️ Stop-Loss: **{sl}**\n"
-        f"🎯 Take-Profit: **{tp}**\n\n"
-        f"💡 *Стартовый ордер аналитики от зоны ликвидности.*"
+        current_price = 2650.00 # Запасное значение, если рынок закрыт или пуст
+        
+    signal_type = "BUY"
+    sl = round(current_price - 6.0, 2)
+    tp = round(current_price + 12.0, 2)
+    
+    latest_signal = {
+        "symbol": "XAUUSD",
+        "signal": signal_type,
+        "entry_price": current_price,
+        "sl": sl,
+        "tp": tp,
+        "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
+        "status": "NEW"
+    }
+    
+    msg = (
+        f"🚀 <b>[STARTUP] ИИ SMC Gold запущен!</b>\n"
+        f"Тестовая аналитика XAUUSD сформирована.\n\n"
+        f"<b>Тип:</b> {signal_type}\n"
+        f"<b>Вход:</b> {current_price}\n"
+        f"<b>SL:</b> {sl} | <b>TP:</b> {tp}\n"
+        f"<i>Ожидание исполнения в cTrader...</i>"
     )
-    send_telegram(text)
-    
-    # Также передаем стартовый сигнал в cTrader для мгновенного теста связи
-    update_api_signal(action, entry, sl, tp)
+    send_telegram(msg)
 
-def analyze_smart_money_trend_sweep():
-    global last_sent_signal
-    now_str = datetime.now().strftime('%H:%M:%S')
-    print(f"[{now_str}] [GOLD] Сканирование рынка (SMC Trend Sweep)...")
-    
-    if not is_market_open():
-        print(f"[{now_str}] [GOLD] Выходные дни. Рынок закрыт. Пропуск.")
-        return
-
-    try:
-        df_h1, df_m15 = get_market_data()
-        if df_h1 is None or df_m15 is None: 
-            return
-
-        trend = determine_h1_trend(df_h1)
-        print(f"[{now_str}] [GOLD] Тренд H1: {trend}")
-        
-        if trend == "SIDEWAYS":
-            print(f"[{now_str}] [GOLD] Флэт/Нет выраженного тренда на H1. Пропуск.")
-            return
-
-        m15_window = df_m15.tail(20)
-        box_high = float(m15_window['High'].iloc[:-2].max())
-        box_low = float(m15_window['Low'].iloc[:-2].min())
-        
-        last_candle = m15_window.iloc[-1]
-        prev_candle = m15_window.iloc[-2]
-        
-        signal_type = None
-        raw_entry = raw_sl = raw_tp = 0.0
-
-        if trend == "BULLISH":
-            if prev_candle['Low'] < box_low and last_candle['Close'] > box_low:
-                raw_entry = float(last_candle['Close'])
-                raw_sl = float(prev_candle['Low']) - 1.5
-                risk = raw_entry - raw_sl
-                
-                if risk > 1.0:
-                    raw_tp = raw_entry + (risk * 2.5)
-                    signal_type = "BUY"
-
-        elif trend == "BEARISH":
-            if prev_candle['High'] > box_high and last_candle['Close'] < box_high:
-                raw_entry = float(last_candle['Close'])
-                raw_sl = float(prev_candle['High']) + 1.5
-                risk = raw_sl - raw_entry
-                
-                if risk > 1.0:
-                    raw_tp = raw_entry - (risk * 2.5)
-                    signal_type = "SELL"
-
-        if signal_type:
-            entry, sl, tp = validate_and_adjust_signal(signal_type, raw_entry, raw_sl, raw_tp)
-
-            if not entry:
-                return
-
-            if signal_type == "BUY" and abs(entry - last_sent_signal["buy_entry"]) < 0.8:
-                print(f"[{now_str}] [GOLD] Повторный BUY сигнал без существенных изменений. Пропуск.")
-                return
-            if signal_type == "SELL" and abs(entry - last_sent_signal["sell_entry"]) < 0.8:
-                print(f"[{now_str}] [GOLD] Повторный SELL сигнал без существенных изменений. Пропуск.")
-                return
-
-            last_sent_signal.update({"buy_entry": entry if signal_type == "BUY" else last_sent_signal["buy_entry"], 
-                                     "sell_entry": entry if signal_type == "SELL" else last_sent_signal["sell_entry"]})
-
-            icon = "🟢 BUY (ПО ТРЕНДУ)" if signal_type == "BUY" else "🔴 SELL (ПО ТРЕНДУ)"
-            text = (
-                f"⚡ **SMART MONEY SWEEP**\n"
-                f"🎯 Направление: **{icon}**\n"
-                f"-----------------------------------------\n"
-                f"📍 Вход: **{entry}**\n"
-                f"🛡️ Stop-Loss: **{sl}**\n"
-                f"🎯 Take-Profit: **{tp}**\n\n"
-                f"💡 *Захвачена ликвидность {('снизу' if signal_type=='BUY' else 'сверху')}.*"
-            )
-            send_telegram(text)
-            update_api_signal(signal_type, entry, sl, tp)
-
-    except Exception as e:
-        print(f"[-] Ошибка в процессе анализа: {e}")
-
-# --- ФОНОВЫЙ ПОТОК СКАНИРОВАНИЯ ---
+# ------------------------------------------------------------------
+# SCANNER TIMER LOOP (SYNCHRONIZED TO M15 CLOSES)
+# ------------------------------------------------------------------
 def market_scanner_loop():
-    print("[+] ИИ GOLD SMC Trend Sweep запущен в круглосуточном режиме (Пн-Пт)")
+    """Таймер сканирования рынка строго в :01, :16, :31, :46 минут"""
+    print("[+] ИИ GOLD SMC Trend Sweep запущен в режиме автосканирования")
+    
+    # 1. Запуск тестового сигнала при старте
     try:
         send_startup_analytics()
     except Exception as e:
-        print(f"[-] Первичная ошибка стартовой аналитики: {e}")
+        print(f"[-] Ошибка стартовой аналитики: {e}")
 
+    # 2. Основной цикл ожидания M15 свечей
     while True:
         try:
-            now = datetime.now()
-            minute_offset = now.minute % 15
+            now = datetime.now(timezone.utc)
+            current_minute = now.minute
+            target_minutes = [1, 16, 31, 46]
             
-            if minute_offset == 1 and now.second < 10:
-                analyze_smart_money_trend_sweep()
-                time.sleep(60)
+            next_min = next((m for m in target_minutes if m > current_minute), None)
+            
+            if next_min is not None:
+                minutes_to_wait = next_min - current_minute
             else:
-                minutes_to_wait = (1 - minute_offset) % 15
-                if minutes_to_wait == 0: 
-                    minutes_to_wait = 15
-                
-                seconds_to_wait = (minutes_to_wait * 60) - now.second
-                time.sleep(seconds_to_wait)
+                minutes_to_wait = (60 - current_minute) + 1
+
+            seconds_to_wait = (minutes_to_wait * 60) - now.second + 1
+            
+            print(f"⏳ Следующий анализ рынка XAUUSD через {int(seconds_to_wait)} сек...")
+            time.sleep(seconds_to_wait)
+
+            analyze_smart_money_trend_sweep()
                 
         except Exception as fatal_error:
-            print(f"[-] Critical error in scanner loop: {fatal_error}")
+            print(f"[-] Ошибка в цикле таймера: {fatal_error}")
             time.sleep(10)
 
-# Запуск сканера в фоновом потоке
-scanner_thread = threading.Thread(target=market_scanner_loop, daemon=True)
-scanner_thread.start()
-
-# --- ENDPOINTS ДЛЯ REST API (cTrader) ---
+# ------------------------------------------------------------------
+# REST API ENDPOINTS FOR CTRADER
+# ------------------------------------------------------------------
 @app.route('/', methods=['GET'])
-def index():
-    return jsonify({"status": "running", "symbol": "XAUUSD"})
+def health_check():
+    return jsonify({"status": "active", "system": "XAUUSD SMC Bridge"}), 200
 
 @app.route('/signal', methods=['GET'])
 def get_signal():
-    with lock:
-        return jsonify(latest_signal)
+    """cTrader опрашивает этот эндпоинт каждые N секунд"""
+    return jsonify(latest_signal), 200
 
 @app.route('/ack', methods=['POST'])
 def acknowledge_signal():
+    """cTrader подтверждает открытие сделки и сбрасывает статус"""
     global latest_signal
-    data = request.get_json(silent=True) or {}
-    ts = data.get('timestamp')
+    latest_signal["status"] = "PROCESSED"
+    print("[+] Сигнал обработан cTrader и переведен в статус PROCESSED")
+    return jsonify({"status": "acknowledged"}), 200
 
-    with lock:
-        if latest_signal["timestamp"] == ts or latest_signal["status"] == "NEW":
-            latest_signal["status"] = "PROCESSED"
-            print(f"👍 Сигнал по XAUUSD (ts={ts}) подтвержден cTrader и переведен в PROCESSED")
-            return jsonify({"status": "acknowledged"})
-            
-    return jsonify({"status": "not_found"}), 404
-
+# ------------------------------------------------------------------
+# APPLICATION ENTRY POINT
+# ------------------------------------------------------------------
 if __name__ == '__main__':
-    port = int(os.environ.get('PORT', 5000))
+    # Запуск фонового сканера рынка
+    scanner_thread = threading.Thread(target=market_scanner_loop, daemon=True)
+    scanner_thread.start()
+    
+    # Запуск Flask API
+    port = int(os.environ.get("PORT", 10000))
     app.run(host='0.0.0.0', port=port)
