@@ -29,11 +29,11 @@ app = Flask(__name__)
 # Глобальное хранилище текущего сигнала для cTrader
 latest_signal = {
     "symbol": "XAUUSD",
-    "signal": "NONE",
-    "entry_price": 0.0,
+    "action": "NONE",
+    "entry": 0.0,
     "sl": 0.0,
     "tp": 0.0,
-    "timestamp": None,
+    "timestamp": int(datetime.now(timezone.utc).timestamp()),
     "status": "NONE"
 }
 
@@ -58,22 +58,42 @@ def send_telegram(text):
         print(f"[-] Исключение при отправке в Telegram: {e}")
 
 # ------------------------------------------------------------------
-# DATA FETCHING (YAHOO FINANCE RATE-LIMIT BYPASS)
+# DATA FETCHING (YAHOO FINANCE RATE-LIMIT BYPASS & RETRIES)
 # ------------------------------------------------------------------
-def get_market_data():
-    """Загрузка данных H1 и M15 с защитой от блокировок Yahoo Finance (429 Rate Limit)"""
-    try:
-        session = requests.Session()
-        session.headers.update({
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-        })
+def fetch_yf_data_with_retry(ticker, period, interval, retries=3):
+    """Безопасная скачка с повторными попытками при 429 Rate Limit"""
+    session = requests.Session()
+    session.headers.update({
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
+    })
 
-        # Запрашиваем минимальный период для ускорения отклика
-        df_h1 = yf.download(YAHOO_TICKER, period="5d", interval="1h", progress=False, session=session)
-        df_m15 = yf.download(YAHOO_TICKER, period="2d", interval="15m", progress=False, session=session)
+    for attempt in range(retries):
+        try:
+            df = yf.download(
+                ticker, 
+                period=period, 
+                interval=interval, 
+                progress=False, 
+                session=session,
+                timeout=10
+            )
+            if df is not None and not df.empty:
+                return df
+        except Exception as e:
+            print(f"[-] Попытка {attempt + 1}/{retries} загрузки {interval} не удалась: {e}")
+        
+        time.sleep(2 * (attempt + 1))  # Задержка перед повтором
+    
+    return pd.DataFrame()
+
+def get_market_data():
+    """Загрузка данных H1 и M15 с защитой от блокировок Yahoo Finance"""
+    try:
+        df_h1 = fetch_yf_data_with_retry(YAHOO_TICKER, period="5d", interval="1h")
+        df_m15 = fetch_yf_data_with_retry(YAHOO_TICKER, period="2d", interval="15m")
         
         if df_h1.empty or df_m15.empty:
-            print("[-] [WARNING] Yahoo вернул пустые данные. Пропуск итерации...")
+            print("[-] [WARNING] Yahoo вернул пустые данные или 429 limit. Пропуск итерации...")
             return None, None
 
         # Разворачиваем MultiIndex если yfinance вернул вложенные колонки
@@ -143,13 +163,14 @@ def analyze_smart_money_trend_sweep():
 
     # Если сгенерирован новый сигнал
     if signal_type != "NONE":
+        now_utc = datetime.now(timezone.utc)
         latest_signal = {
             "symbol": "XAUUSD",
-            "signal": signal_type,
-            "entry_price": current_price,
+            "action": signal_type,
+            "entry": current_price,
             "sl": sl,
             "tp": tp,
-            "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
+            "timestamp": int(now_utc.timestamp()),
             "status": "NEW"
         }
         
@@ -161,7 +182,7 @@ def analyze_smart_money_trend_sweep():
             f"<b>Вход:</b> {current_price}\n"
             f"<b>SL:</b> {sl}\n"
             f"<b>TP:</b> {tp}\n"
-            f"<b>Время:</b> {latest_signal['timestamp']}"
+            f"<b>Время:</b> {now_utc.strftime('%Y-%m-%d %H:%M:%S UTC')}"
         )
         send_telegram(msg)
 
@@ -171,24 +192,27 @@ def analyze_smart_money_trend_sweep():
 def send_startup_analytics():
     """Стартовый сигнал при перезапуске сервера для проверки связки с cTrader/Telegram"""
     global latest_signal
-    df_h1, df_m15 = get_market_data()
-    
-    if df_m15 is not None and not df_m15.empty:
-        current_price = round(float(df_m15['Close'].iloc[-1]), 2)
-    else:
-        current_price = 2650.00 # Запасное значение, если рынок закрыт или пуст
+    try:
+        df_h1, df_m15 = get_market_data()
+        if df_m15 is not None and not df_m15.empty:
+            current_price = round(float(df_m15['Close'].iloc[-1]), 2)
+        else:
+            current_price = 2650.00
+    except Exception:
+        current_price = 2650.00
         
     signal_type = "BUY"
     sl = round(current_price - 6.0, 2)
     tp = round(current_price + 12.0, 2)
+    now_utc = datetime.now(timezone.utc)
     
     latest_signal = {
         "symbol": "XAUUSD",
-        "signal": signal_type,
-        "entry_price": current_price,
+        "action": signal_type,
+        "entry": current_price,
         "sl": sl,
         "tp": tp,
-        "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
+        "timestamp": int(now_utc.timestamp()),
         "status": "NEW"
     }
     
@@ -240,8 +264,7 @@ def market_scanner_loop():
             print(f"[-] Ошибка в цикле таймера: {fatal_error}")
             time.sleep(10)
 
-
-    # ------------------------------------------------------------------
+# ------------------------------------------------------------------
 # REST API ENDPOINTS FOR CTRADER
 # ------------------------------------------------------------------
 @app.route('/', methods=['GET'])
@@ -273,8 +296,5 @@ def start_background_scanner():
 start_background_scanner()
 
 if __name__ == '__main__':
-    port = int(os.environ.get("PORT", 10000))
-    app.run(host='0.0.0.0', port=port)
-    # Запуск Flask API
     port = int(os.environ.get("PORT", 10000))
     app.run(host='0.0.0.0', port=port)
