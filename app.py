@@ -240,7 +240,8 @@ def market_scanner_loop():
             print(f"[-] Ошибка в цикле таймера: {fatal_error}")
             time.sleep(10)
 
-# ------------------------------------------------------------------
+
+    # ------------------------------------------------------------------
 # REST API ENDPOINTS FOR CTRADER
 # ------------------------------------------------------------------
 @app.route('/', methods=['GET'])
@@ -261,13 +262,19 @@ def acknowledge_signal():
     return jsonify({"status": "acknowledged"}), 200
 
 # ------------------------------------------------------------------
-# APPLICATION ENTRY POINT
+# THREAD INITIALIZATION FOR GUNICORN / RENDER
 # ------------------------------------------------------------------
-if __name__ == '__main__':
-    # Запуск фонового сканера рынка
+def start_background_scanner():
+    """Запуск фонового потока при старте Gunicorn/Flask"""
     scanner_thread = threading.Thread(target=market_scanner_loop, daemon=True)
     scanner_thread.start()
-    
+
+# Запускаем фоновый процесс сразу при импорте модуля WSGI-сервером
+start_background_scanner()
+
+if __name__ == '__main__':
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host='0.0.0.0', port=port)
     # Запуск Flask API
     port = int(os.environ.get("PORT", 10000))
     app.run(host='0.0.0.0', port=port)
