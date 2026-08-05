@@ -105,7 +105,7 @@ def fetch_tf_data(interval):
         return interval, None
 
 def get_multi_tf_market_data():
-    """Последовательная загрузка H4, H1 и M15 с паузй для соблюдения лимита 8 zapros/min"""
+    """Последовательная загрузка H4, H1 и M15 с паузой для соблюдения лимита 8 зап/мин"""
     intervals = ["4h", "1h", "15min"]
     dfs = {}
     
@@ -114,7 +114,7 @@ def get_multi_tf_market_data():
         if df is None:
             return None, None, None
         dfs[interval] = df
-        time.sleep(1.2) # Пауза 1.2 секунды между запросами, чтобы не превысить лимит 8 зап/мин
+        time.sleep(1.2) # Пауза 1.2 секунды между запросами
 
     return dfs["4h"], dfs["1h"], dfs["15min"]
 
@@ -152,7 +152,6 @@ def run_gold_analytics():
     sl, tp = 0.0, 0.0
 
     # 3. Логика сигналов SMC Sweep & Structure Breakout
-    # Покупка: Бычий тренд + Забор ликвидности снизу (Liquidity Sweep Low)
     if is_bullish and float(last_m15['Low']) < swing_low and float(last_m15['Close']) > swing_low:
         action = "BUY"
         reason = "SMC Liquidity Sweep Low (снятие продавцов на M15 в направлении H4/H1 тренда)"
@@ -162,7 +161,6 @@ def run_gold_analytics():
         sl = round(curr_price - sl_dist, 2)
         tp = round(curr_price + tp_dist, 2)
 
-    # Продажа: Медвежий тренд + Забор ликвидности сверху (Liquidity Sweep High)
     elif not is_bullish and float(last_m15['High']) > swing_high and float(last_m15['Close']) < swing_high:
         action = "SELL"
         reason = "SMC Liquidity Sweep High (снятие покупателей на M15 в направлении H4/H1 тренда)"
@@ -172,15 +170,14 @@ def run_gold_analytics():
         sl = round(curr_price + sl_dist, 2)
         tp = round(curr_price - tp_dist, 2)
 
-    # Базовый трендовый вход (если нет ясного Sweep, но есть сильный трендовый импульс)
     elif is_bullish:
         action = "BUY"
-        reason = "Почасовой трендовый импульс H4/H1"
+        reason = "3-Часовой трендовый импульс H4/H1"
         sl = round(curr_price - 7.5, 2)
         tp = round(curr_price + 15.0, 2)
     else:
         action = "SELL"
-        reason = "Почасовой трендовый импульс H4/H1"
+        reason = "3-Часовой трендовый импульс H4/H1"
         sl = round(curr_price + 7.5, 2)
         tp = round(curr_price - 15.0, 2)
 
@@ -214,37 +211,28 @@ def run_gold_analytics():
     print(f"[+] Аналитика завершена. Сигнал: {action} @ {curr_price}")
 
 # ------------------------------------------------------------------
-# СИНХРОНИЗИРОВАННЫЙ С АСТРОНОМИЧЕСКИМИ ЧАСАМИ ТАЙМЕР (СДВИГ +1 ЧАС ДЛЯ ЗОЛОТА)
+# ТОЧНЫЙ СИНХРОНИЗИРОВАННЫЙ ТАЙМЕР (СДВИГ +1 ЧАС UTC)
 # ------------------------------------------------------------------
 def get_seconds_until_next_3h_mark():
     """
-    Вычисляет оставшиеся секунды до 3-часовых меток с учетом сдвига на +1 час (UTC):
-    Метки запуска: 01:00, 04:00, 07:00, 10:00, 13:00, 16:00, 19:00, 22:00 UTC
+    Вычисляет секунды до меток: 01:00, 04:00, 07:00, 10:00, 13:00, 16:00, 19:00, 22:00 UTC
     """
     now = datetime.now(timezone.utc)
-    
-    # Сетка часов с учетом смещения рынка Золота (+1 час)
     gold_schedule_hours = [1, 4, 7, 10, 13, 16, 19, 22]
-    
-    target_hour = None
+
     for h in gold_schedule_hours:
-        if now.hour < h:
-            target_hour = h
-            break
-            
-    if target_hour is not None:
-        target_time = now.replace(hour=target_hour, minute=0, second=10, microsecond=0)
-    else:
-        # Если время больше 22:00 UTC, следующий запуск завтра в 01:00 UTC
-        target_time = (now + timedelta(days=1)).replace(hour=1, minute=0, second=10, microsecond=0)
-        
-    sleep_seconds = (target_time - now).total_seconds()
-    return max(sleep_seconds, 5)
+        target_time = now.replace(hour=h, minute=0, second=10, microsecond=0)
+        if target_time > now:
+            return (target_time - now).total_seconds()
+
+    # Если все метки на сегодня уже прошли (после 22:00:10 UTC), целимся на завтра 01:00:10 UTC
+    target_time = (now + timedelta(days=1)).replace(hour=1, minute=0, second=10, microsecond=0)
+    return (target_time - now).total_seconds()
 
 def analytics_scheduler_loop():
-    """Первичный запуск при старте, затем выравнивание по сетке Золота (01, 04, 07... UTC)"""
+    """Первичный запуск при старте, затем выравнивание по сетке Золота"""
     time.sleep(3)
-    run_gold_analytics()  # Стартовый анализ при запускe
+    run_gold_analytics()  # Стартовый анализ при запуске
 
     while True:
         sleep_time = get_seconds_until_next_3h_mark()
