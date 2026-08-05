@@ -1,41 +1,63 @@
 import os
 import time
-import requests
+import json
 import threading
-import pandas as pd
-import numpy as np
-import yfinance as yf
-from flask import Flask, jsonify, request
 from datetime import datetime, timezone
-
-# ------------------------------------------------------------------
-# CONFIGURATION & ENVIRONMENT VARIABLES
-# ------------------------------------------------------------------
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "8874872969:AAHtxvHw_mupom466pm3jh4BkZEjEAQ180A")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "@XauProBot")
-
-YAHOO_TICKER = "GC=F"
-FUTURES_SPOT_OFFSET = 5.4  # Коррекция цен GC=F под спот XAUUSD
-
-# Параметры риск-менеджмента для Gold (XAUUSD)
-RISK_REWARD_RATIO = 2.0
-MIN_SL_DIST = 5.0   # Минимальный Стоп-Лосс ($5)
-MAX_SL_DIST = 10.0  # Максимальный Стоп-Лосс ($10)
-MIN_TP_DIST = 12.0  # Минимальный Тейк-Профит ($12)
-MAX_TP_DIST = 40.0  # Максимальный Тейк-Профит ($40)
+from concurrent.futures import ThreadPoolExecutor
+from flask import Flask, jsonify, request
+import pandas as pd
+import requests
 
 app = Flask(__name__)
 
-# Глобальное хранилище текущего сигнала для cTrader
-latest_signal = {
+# ------------------------------------------------------------------
+# НАСТРОЙКИ И ПЕРЕМЕННЫЕ ОКРУЖЕНИЯ
+# ------------------------------------------------------------------
+TWELVE_DATA_API_KEY = os.getenv("TWELVE_DATA_API_KEY", "c997ad22987e477e83034ea132621542")
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "8874872969:AAHtxvHw_mupom466pm3jh4BkZEjEAQ180A")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "@XauProBot")
+
+SYMBOL = "XAU/USD"
+SIGNAL_FILE = "/tmp/gold_analytics_signal.json"
+SIGNAL_LIFETIME_SECONDS = 10800  # Сигнал активен 3 часа (10800 сек)
+
+# Параметры риск-менеджмента для Gold (XAUUSD)
+RISK_REWARD_RATIO = 2.0
+MIN_SL_DIST = 5.0    # Минимальный Стоп-Лосс ($5)
+MAX_SL_DIST = 15.0   # Максимальный Стоп-Лосс ($15)
+MIN_TP_DIST = 10.0   # Минимальный Тейк-Профит ($10)
+MAX_TP_DIST = 45.0   # Максимальный Тейк-Профит ($45)
+
+EMPTY_SIGNAL = {
     "symbol": "XAUUSD",
     "action": "NONE",
     "entry": 0.0,
     "sl": 0.0,
     "tp": 0.0,
-    "timestamp": int(datetime.now(timezone.utc).timestamp()),
-    "status": "NONE"
+    "status": "NONE",
+    "timestamp": 0
 }
+
+lock = threading.Lock()
+
+# ------------------------------------------------------------------
+# РАБОТА С ФАЙЛОМ СИГНАЛА
+# ------------------------------------------------------------------
+def save_signal_to_file(signal_data):
+    try:
+        with open(SIGNAL_FILE, "w") as f:
+            json.dump(signal_data, f)
+    except Exception as e:
+        print(f"[-] Ошибка записи сигнала в файл: {e}")
+
+def load_signal_from_file():
+    if not os.path.exists(SIGNAL_FILE):
+        return EMPTY_SIGNAL
+    try:
+        with open(SIGNAL_FILE, "r") as f:
+            return json.load(f)
+    except Exception:
+        return EMPTY_SIGNAL
 
 # ------------------------------------------------------------------
 # TELEGRAM NOTIFIER
@@ -51,262 +73,201 @@ def send_telegram(text):
     try:
         res = requests.post(url, json=payload, timeout=10)
         if res.status_code == 200:
-            print("[+] Сигнал успешно отправлен в Telegram!")
+            print("[+] Сообщение успешно отправлено в Telegram!")
         else:
             print(f"[-] Ошибка отправки в Telegram: {res.text}")
     except Exception as e:
         print(f"[-] Исключение при отправке в Telegram: {e}")
 
 # ------------------------------------------------------------------
-# DATA FETCHING (YAHOO FINANCE RATE-LIMIT BYPASS & RETRIES)
+# ЗАГРУЗКА ДАННЫХ ИЗ TWELVEDATA API
 # ------------------------------------------------------------------
-def fetch_yf_data_with_retry(ticker, period, interval, retries=3):
-    """Безопасная скачка с повторными попытками при 429 Rate Limit"""
-    session = requests.Session()
-    session.headers.update({
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
-    })
-
-    for attempt in range(retries):
-        try:
-            df = yf.download(
-                ticker, 
-                period=period, 
-                interval=interval, 
-                progress=False, 
-                session=session,
-                timeout=10
-            )
-            if df is not None and not df.empty:
-                return df
-        except Exception as e:
-            print(f"[-] Попытка {attempt + 1}/{retries} загрузки {interval} не удалась: {e}")
-        
-        time.sleep(2 * (attempt + 1))  # Задержка перед повтором
-    
-    return pd.DataFrame()
-
-def get_market_data():
-    """Загрузка данных H1 и M15 с защитой от блокировок Yahoo Finance"""
+def fetch_tf_data(interval):
+    """Загрузка таймфрейма через TwelveData"""
     try:
-        df_h1 = fetch_yf_data_with_retry(YAHOO_TICKER, period="5d", interval="1h")
-        df_m15 = fetch_yf_data_with_retry(YAHOO_TICKER, period="2d", interval="15m")
+        headers = {'User-Agent': 'Mozilla/5.0'}
+        url = f"https://api.twelvedata.com/time_series?symbol={SYMBOL}&interval={interval}&outputsize=40&apikey={TWELVE_DATA_API_KEY}"
         
-        if df_h1.empty or df_m15.empty:
-            print("[-] [WARNING] Yahoo вернул пустые данные или 429 limit. Пропуск итерации...")
-            return None, None
-
-        # Разворачиваем MultiIndex если yfinance вернул вложенные колонки
-        if isinstance(df_h1.columns, pd.MultiIndex):
-            df_h1.columns = df_h1.columns.get_level_values(0)
-        if isinstance(df_m15.columns, pd.MultiIndex):
-            df_m15.columns = df_m15.columns.get_level_values(0)
-            
-        # Корректировка цен с фьючерса на спот XAUUSD
-        for df in [df_h1, df_m15]:
-            df['High'] -= FUTURES_SPOT_OFFSET
-            df['Low'] -= FUTURES_SPOT_OFFSET
-            df['Close'] -= FUTURES_SPOT_OFFSET
-            df['Open'] -= FUTURES_SPOT_OFFSET
-            
-        return df_h1, df_m15
+        res = requests.get(url, headers=headers, timeout=10).json()
+        
+        if "values" not in res:
+            print(f"[-] Ошибка TwelveData на {interval}: {res.get('message', 'No values')}")
+            return interval, None
+        
+        df = pd.DataFrame(res["values"])
+        for col in ['open', 'high', 'low', 'close']:
+            df[col] = df[col].astype(float)
+        df.rename(columns={'open': 'Open', 'high': 'High', 'low': 'Low', 'close': 'Close'}, inplace=True)
+        # Разворачиваем порядок хронологически (от старых к новым)
+        df.iloc[:] = df.iloc[::-1].values
+        return interval, df
     except Exception as e:
-        print(f"[-] Ошибка загрузки данных Yahoo: {e}")
-        return None, None
+        print(f"[-] Исключение при загрузке {interval}: {e}")
+        return interval, None
+
+def get_multi_tf_market_data():
+    """Параллельная загрузка H4, H1 и M15"""
+    intervals = ["4h", "1h", "15min"]
+    dfs = {}
+    
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        results = executor.map(fetch_tf_data, intervals)
+        for interval, df in results:
+            if df is None:
+                return None, None, None
+            dfs[interval] = df
+
+    return dfs["4h"], dfs["1h"], dfs["15min"]
 
 # ------------------------------------------------------------------
-# SMC TREND SWEEP STRATEGY LOGIC
+# SMC АНАЛИТИКА И ГЕНЕРАЦИЯ СИГНАЛА (3h CYCLE)
 # ------------------------------------------------------------------
-def analyze_smart_money_trend_sweep():
-    """Анализ рынка по алгоритму SMC Trend Sweep для Gold"""
-    global latest_signal
-    
-    df_h1, df_m15 = get_market_data()
-    if df_h1 is None or df_m15 is None:
+def run_gold_analytics():
+    """Основной анализ рынка XAUUSD по SMC концепции"""
+    now_utc = datetime.now(timezone.utc)
+    print(f"🔍 [{now_utc.strftime('%Y-%m-%d %H:%M:%S UTC')}] Старт 3-часового SMC анализа Gold (H4, H1, M15)...")
+
+    df_h4, df_h1, df_m15 = get_multi_tf_market_data()
+    if df_h4 is None or df_h1 is None or df_m15 is None:
+        print("[-] Ошибка: Не удалось получить данные от TwelveData. Пропуск цикла.")
         return
 
-    # 1. Определение H1 Тренда
-    h1_close = df_h1['Close'].iloc[-1]
-    h1_sma = df_h1['Close'].rolling(window=20).mean().iloc[-1]
-    h1_trend = "BULLISH" if h1_close > h1_sma else "BEARISH"
+    curr_price = round(float(df_m15['Close'].iloc[-1]), 2)
 
-    # 2. Поиск Liquidity Sweep на M15 (последние 20 свечей)
+    # 1. Тренд H4 и H1 (по скользящим средним и структуре)
+    h4_ema = df_h4['Close'].tail(20).mean()
+    h1_ema = df_h1['Close'].tail(20).mean()
+    
+    is_bullish = curr_price >= h4_ema and curr_price >= h1_ema
+    trend_str = "🟢 BULLISH (Бычий)" if is_bullish else "🔴 BEARISH (Медвежий)"
+
+    # 2. Анализ ликвидности M15 / H1
     recent_m15 = df_m15.iloc[-20:-1]
-    last_candle = df_m15.iloc[-1]
+    last_m15 = df_m15.iloc[-1]
     
-    swing_high = recent_m15['High'].max()
-    swing_low = recent_m15['Low'].min()
-    
-    current_price = round(float(last_candle['Close']), 2)
-    signal_type = "NONE"
+    swing_high = float(recent_m15['High'].max())
+    swing_low = float(recent_m15['Low'].min())
+
+    action = "NONE"
+    reason = ""
     sl, tp = 0.0, 0.0
 
-    # Покупка: Бычий тренд + Снятие лоев (Liquidity Sweep Low)
-    if h1_trend == "BULLISH" and last_candle['Low'] < swing_low and last_candle['Close'] > swing_low:
-        signal_type = "BUY"
-        raw_sl_dist = current_price - float(last_candle['Low'])
-        sl_dist = max(MIN_SL_DIST, min(raw_sl_dist + 1.0, MAX_SL_DIST))
+    # 3. Логика сигналов SMC Sweep & Structure Breakout
+    # Покупка: Бычий тренд + Забор ликвидности снизу (Liquidity Sweep Low)
+    if is_bullish and float(last_m15['Low']) < swing_low and float(last_m15['Close']) > swing_low:
+        action = "BUY"
+        reason = "SMC Liquidity Sweep Low (снятие продавцов на M15 в направлении H4/H1 тренда)"
+        raw_sl = float(last_m15['Low']) - 0.5
+        sl_dist = max(MIN_SL_DIST, min(curr_price - raw_sl, MAX_SL_DIST))
         tp_dist = max(MIN_TP_DIST, min(sl_dist * RISK_REWARD_RATIO, MAX_TP_DIST))
-        
-        sl = round(current_price - sl_dist, 2)
-        tp = round(current_price + tp_dist, 2)
+        sl = round(curr_price - sl_dist, 2)
+        tp = round(curr_price + tp_dist, 2)
 
-    # Продажа: Медвежий тренд + Снятие хаев (Liquidity Sweep High)
-    elif h1_trend == "BEARISH" and last_candle['High'] > swing_high and last_candle['Close'] < swing_high:
-        signal_type = "SELL"
-        raw_sl_dist = float(last_candle['High']) - current_price
-        sl_dist = max(MIN_SL_DIST, min(raw_sl_dist + 1.0, MAX_SL_DIST))
+    # Продажа: Медвежий тренд + Забор ликвидности сверху (Liquidity Sweep High)
+    elif not is_bullish and float(last_m15['High']) > swing_high and float(last_m15['Close']) < swing_high:
+        action = "SELL"
+        reason = "SMC Liquidity Sweep High (снятие покупателей на M15 в направлении H4/H1 тренда)"
+        raw_sl = float(last_m15['High']) + 0.5
+        sl_dist = max(MIN_SL_DIST, min(raw_sl - curr_price, MAX_SL_DIST))
         tp_dist = max(MIN_TP_DIST, min(sl_dist * RISK_REWARD_RATIO, MAX_TP_DIST))
-        
-        sl = round(current_price + sl_dist, 2)
-        tp = round(current_price - tp_dist, 2)
+        sl = round(curr_price + sl_dist, 2)
+        tp = round(curr_price - tp_dist, 2)
 
-    # Если сгенерирован новый сигнал
-    if signal_type != "NONE":
-        now_utc = datetime.now(timezone.utc)
-        latest_signal = {
-            "symbol": "XAUUSD",
-            "action": signal_type,
-            "entry": current_price,
-            "sl": sl,
-            "tp": tp,
-            "timestamp": int(now_utc.timestamp()),
-            "status": "NEW"
-        }
-        
-        # Отправка в Telegram
-        msg = (
-            f"⚡ <b>GOLD SMC TREND SWEEP SIGNAL</b> ⚡\n\n"
-            f"<b>Инструмент:</b> XAUUSD\n"
-            f"<b>Тип:</b> {signal_type}\n"
-            f"<b>Вход:</b> {current_price}\n"
-            f"<b>SL:</b> {sl}\n"
-            f"<b>TP:</b> {tp}\n"
-            f"<b>Время:</b> {now_utc.strftime('%Y-%m-%d %H:%M:%S UTC')}"
-        )
-        send_telegram(msg)
+    # Базовый трендовый вход (если нет ясного Sweep, но есть сильный трендовый импульс)
+    elif is_bullish:
+        action = "BUY"
+        reason = "Почасовой трендовый импульс H4/H1"
+        sl = round(curr_price - 7.5, 2)
+        tp = round(curr_price + 15.0, 2)
+    else:
+        action = "SELL"
+        reason = "Почасовой трендовый импульс H4/H1"
+        sl = round(curr_price + 7.5, 2)
+        tp = round(curr_price - 15.0, 2)
 
-# ------------------------------------------------------------------
-# STARTUP TEST ANALYTICS SIGNAL
-# ------------------------------------------------------------------
-def send_startup_analytics():
-    """Стартовый сигнал при перезапуске сервера для проверки связки с cTrader/Telegram"""
-    global latest_signal
-    try:
-        df_h1, df_m15 = get_market_data()
-        if df_m15 is not None and not df_m15.empty:
-            current_price = round(float(df_m15['Close'].iloc[-1]), 2)
-        else:
-            current_price = 2650.00
-    except Exception:
-        current_price = 2650.00
-        
-    signal_type = "BUY"
-    sl = round(current_price - 6.0, 2)
-    tp = round(current_price + 12.0, 2)
-    now_utc = datetime.now(timezone.utc)
-    
-    latest_signal = {
+    # Сохраняем сигнал для cTrader
+    signal = {
         "symbol": "XAUUSD",
-        "action": signal_type,
-        "entry": current_price,
+        "action": action,
+        "entry": curr_price,
         "sl": sl,
         "tp": tp,
-        "timestamp": int(now_utc.timestamp()),
-        "status": "NEW"
+        "status": "NEW",
+        "timestamp": int(now_utc.timestamp())
     }
-    
+
+    with lock:
+        save_signal_to_file(signal)
+
+    # Отправка подробного отчета в Telegram
     msg = (
-        f"🚀 <b>[STARTUP] ИИ SMC Gold запущен!</b>\n"
-        f"Тестовая аналитика XAUUSD сформирована.\n\n"
-        f"<b>Тип:</b> {signal_type}\n"
-        f"<b>Вход:</b> {current_price}\n"
-        f"<b>SL:</b> {sl} | <b>TP:</b> {tp}\n"
-        f"<i>Ожидание исполнения в cTrader...</i>"
+        f"🏆 <b>GOLD SMC ANALYTICS REPORT (3H)</b> 🏆\n\n"
+        f"<b>Инструмент:</b> XAU/USD (Gold)\n"
+        f"<b>Макро-Тренд (H4/H1):</b> {trend_str}\n"
+        f"<b>Рекомендация:</b> <b>{action}</b>\n\n"
+        f"📍 <b>Вход:</b> <code>{curr_price}</code>\n"
+        f"🛑 <b>Stop Loss:</b> <code>{sl}</code>\n"
+        f"🎯 <b>Take Profit:</b> <code>{tp}</code>\n\n"
+        f"💡 <b>Обоснование:</b> {reason}\n"
+        f"🕒 <i>Время анализа: {now_utc.strftime('%H:%M:%S UTC')}</i>"
     )
     send_telegram(msg)
+    print(f"[+] Аналитика завершена. Сигнал: {action} @ {curr_price}")
 
 # ------------------------------------------------------------------
-# SCANNER TIMER LOOP (SYNCHRONIZED TO M15 CLOSES)
+# КРУГЛОСУТОЧНЫЙ ТАЙМЕР (КАЖДЫЕ 3 ЧАСА)
 # ------------------------------------------------------------------
-def market_scanner_loop():
-    """Таймер сканирования рынка строго в :01, :16, :31, :46 минут"""
-    print("[+] ИИ GOLD SMC Trend Sweep запущен в режиме автосканирования")
-    
-    # 1. Запуск тестового сигнала при старте
-    try:
-        send_startup_analytics()
-    except Exception as e:
-        print(f"[-] Ошибка стартовой аналитики: {e}")
+def analytics_scheduler_loop():
+    """Запускает анализ при старте и затем строго каждые 3 часа (10800 сек)"""
+    time.sleep(3)
+    run_gold_analytics()  # Запуск при старте сервера
 
-    # 2. Основной цикл ожидания M15 свечей
     while True:
-        try:
-            now = datetime.now(timezone.utc)
-            current_minute = now.minute
-            target_minutes = [1, 16, 31, 46]
-            
-            next_min = next((m for m in target_minutes if m > current_minute), None)
-            
-            if next_min is not None:
-                minutes_to_wait = next_min - current_minute
-            else:
-                minutes_to_wait = (60 - current_minute) + 1
+        # Пауза ровно 3 часа (10800 секунд)
+        time.sleep(10800)
+        run_gold_analytics()
 
-            seconds_to_wait = (minutes_to_wait * 60) - now.second + 1
-            
-            print(f"⏳ Следующий анализ рынка XAUUSD через {int(seconds_to_wait)} сек...")
-            time.sleep(seconds_to_wait)
-
-            analyze_smart_money_trend_sweep()
-                
-        except Exception as fatal_error:
-            print(f"[-] Ошибка в цикле таймера: {fatal_error}")
-            time.sleep(10)
+threading.Thread(target=analytics_scheduler_loop, daemon=True).start()
 
 # ------------------------------------------------------------------
-# REST API ENDPOINTS FOR CTRADER
+# REST API ENDPOINTS FOR CTRADER / CLIENTS
 # ------------------------------------------------------------------
 @app.route('/', methods=['GET'])
-def health_check():
-    return jsonify({"status": "active", "system": "XAUUSD SMC Bridge"}), 200
+def index():
+    return jsonify({"status": "active", "service": "Gold 3H SMC Analytics Engine"})
 
+@app.route('/scalp_signal', methods=['GET'])
 @app.route('/signal', methods=['GET'])
 def get_signal():
-    """cTrader опрашивает этот эндпоинт каждые N секунд"""
-    return jsonify(latest_signal), 200
+    """Выдача текущего актуального сигнала"""
+    with lock:
+        signal = load_signal_from_file()
+        current_time = int(time.time())
+        signal_timestamp = signal.get("timestamp", 0)
 
+        if signal.get("action") != "NONE" and (current_time - signal_timestamp) <= SIGNAL_LIFETIME_SECONDS:
+            signal["status"] = "NEW"
+        else:
+            signal["status"] = "EXPIRED"
+            signal["action"] = "NONE"
+
+        return jsonify(signal), 200
+
+@app.route('/scalp_ack', methods=['POST'])
 @app.route('/ack', methods=['POST'])
 def acknowledge_signal():
-    """cTrader подтверждает открытие сделки и сбрасывает статус"""
-    global latest_signal
-    latest_signal["status"] = "PROCESSED"
-    print("[+] Сигнал обработан cTrader и переведен в статус PROCESSED")
+    """Логирование подтверждения приема сигнала клиентом"""
+    data = request.get_json(silent=True) or {}
+    print(f"👍 [ACK] Сигнал подтвержден клиентом: {data.get('client_id', request.remote_addr)}")
     return jsonify({"status": "acknowledged"}), 200
 
-# ------------------------------------------------------------------
-# THREAD INITIALIZATION FOR GUNICORN / RENDER
-# ------------------------------------------------------------------
-def start_background_scanner():
-    """Запуск фонового потока при старте Gunicorn/Flask"""
-    scanner_thread = threading.Thread(target=market_scanner_loop, daemon=True)
-    scanner_thread.start()
+@app.route('/force_analytics', methods=['GET', 'POST'])
+def force_analytics():
+    """Ручной принудительный запуск анализа"""
+    run_gold_analytics()
+    with lock:
+        return jsonify({"message": "Принудительный 3H анализ выполнен", "signal": load_signal_from_file()}), 200
 
-# Запускаем фоновый процесс сразу при импорте модуля WSGI-сервером
-start_background_scanner()
-@app.route('/test_signal', methods=['GET', 'POST'])
-def trigger_test_signal():
-    global latest_signal
-    latest_signal = {
-        "status": "NEW",
-        "action": "BUY",
-        "symbol": "XAUUSD",
-        "entry": 2650.00,
-        "sl": 2640.00,
-        "tp": 2670.00,
-        "timestamp": int(time.time())
-    }
-    return jsonify({"message": "Тестовый сигнал создан!", "signal": latest_signal}), 200
 if __name__ == '__main__':
-    port = int(os.environ.get("PORT", 10000))
+    port = int(os.environ.get('PORT', 10000))
     app.run(host='0.0.0.0', port=port)
