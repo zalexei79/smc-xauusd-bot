@@ -3,7 +3,6 @@ import time
 import json
 import threading
 from datetime import datetime, timezone, timedelta
-from concurrent.futures import ThreadPoolExecutor
 from flask import Flask, jsonify, request
 import pandas as pd
 import requests
@@ -80,7 +79,7 @@ def send_telegram(text):
         print(f"[-] Исключение при отправке в Telegram: {e}")
 
 # ------------------------------------------------------------------
-# ЗАГРУЗКА ДАННЫХ ИЗ TWELVEDATA API
+# ЗАГРУЗКА ДАННЫХ ИЗ TWELVEDATA API (С ЗАЩИТОЙ ОТ ПРЕВЫШЕНИЯ ЛИМИТОВ)
 # ------------------------------------------------------------------
 def fetch_tf_data(interval):
     """Загрузка таймфрейма через TwelveData"""
@@ -106,16 +105,16 @@ def fetch_tf_data(interval):
         return interval, None
 
 def get_multi_tf_market_data():
-    """Параллельная загрузка H4, H1 и M15"""
+    """Последовательная загрузка H4, H1 и M15 с паузй для соблюдения лимита 8 zapros/min"""
     intervals = ["4h", "1h", "15min"]
     dfs = {}
     
-    with ThreadPoolExecutor(max_workers=3) as executor:
-        results = executor.map(fetch_tf_data, intervals)
-        for interval, df in results:
-            if df is None:
-                return None, None, None
-            dfs[interval] = df
+    for interval in intervals:
+        _, df = fetch_tf_data(interval)
+        if df is None:
+            return None, None, None
+        dfs[interval] = df
+        time.sleep(1.2) # Пауза 1.2 секунды между запросами, чтобы не превысить лимит 8 зап/мин
 
     return dfs["4h"], dfs["1h"], dfs["15min"]
 
@@ -215,33 +214,42 @@ def run_gold_analytics():
     print(f"[+] Аналитика завершена. Сигнал: {action} @ {curr_price}")
 
 # ------------------------------------------------------------------
-# СИНХРОНИЗИРОВАННЫЙ С АСТРОНОМИЧЕСКИМИ ЧАСАМИ ТАЙМЕР (UTC)
+# СИНХРОНИЗИРОВАННЫЙ С АСТРОНОМИЧЕСКИМИ ЧАСАМИ ТАЙМЕР (СДВИГ +1 ЧАС ДЛЯ ЗОЛОТА)
 # ------------------------------------------------------------------
 def get_seconds_until_next_3h_mark():
-    """Вычисляет оставшиеся секунды до ближайшего 3-часового рубежа UTC (+10 сек задержки)"""
+    """
+    Вычисляет оставшиеся секунды до 3-часовых меток с учетом сдвига на +1 час (UTC):
+    Метки запуска: 01:00, 04:00, 07:00, 10:00, 13:00, 16:00, 19:00, 22:00 UTC
+    """
     now = datetime.now(timezone.utc)
-    current_hour = now.hour
     
-    # Ближайший следующий час, кратный 3 (03, 06, 09, 12, 15, 18, 21, 24)
-    next_hour = ((current_hour // 3) + 1) * 3
+    # Сетка часов с учетом смещения рынка Золота (+1 час)
+    gold_schedule_hours = [1, 4, 7, 10, 13, 16, 19, 22]
     
-    if next_hour >= 24:
-        target_time = (now + timedelta(days=1)).replace(hour=0, minute=0, second=10, microsecond=0)
+    target_hour = None
+    for h in gold_schedule_hours:
+        if now.hour < h:
+            target_hour = h
+            break
+            
+    if target_hour is not None:
+        target_time = now.replace(hour=target_hour, minute=0, second=10, microsecond=0)
     else:
-        target_time = now.replace(hour=next_hour, minute=0, second=10, microsecond=0)
+        # Если время больше 22:00 UTC, следующий запуск завтра в 01:00 UTC
+        target_time = (now + timedelta(days=1)).replace(hour=1, minute=0, second=10, microsecond=0)
         
     sleep_seconds = (target_time - now).total_seconds()
     return max(sleep_seconds, 5)
 
 def analytics_scheduler_loop():
-    """Первичный запуск при старте, затем выравнивание по ровным 3-часовым меткам UTC"""
+    """Первичный запуск при старте, затем выравнивание по сетке Золота (01, 04, 07... UTC)"""
     time.sleep(3)
-    run_gold_analytics()  # Стартовый анализ
+    run_gold_analytics()  # Стартовый анализ при запускe
 
     while True:
         sleep_time = get_seconds_until_next_3h_mark()
         minutes_wait = round(sleep_time / 60, 1)
-        print(f"⏳ Ожидание {minutes_wait} мин. ({int(sleep_time)} сек.) до следующей 3H свечи (UTC)...")
+        print(f"⏳ Ожидание {minutes_wait} мин. ({int(sleep_time)} сек.) до следующего 3H цикла Gold (UTC)...")
         time.sleep(sleep_time)
         run_gold_analytics()
 
