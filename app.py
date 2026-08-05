@@ -2,7 +2,7 @@ import os
 import time
 import json
 import threading
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from concurrent.futures import ThreadPoolExecutor
 from flask import Flask, jsonify, request
 import pandas as pd
@@ -215,16 +215,34 @@ def run_gold_analytics():
     print(f"[+] Аналитика завершена. Сигнал: {action} @ {curr_price}")
 
 # ------------------------------------------------------------------
-# КРУГЛОСУТОЧНЫЙ ТАЙМЕР (КАЖДЫЕ 3 ЧАСА)
+# СИНХРОНИЗИРОВАННЫЙ С АСТРОНОМИЧЕСКИМИ ЧАСАМИ ТАЙМЕР (UTC)
 # ------------------------------------------------------------------
+def get_seconds_until_next_3h_mark():
+    """Вычисляет оставшиеся секунды до ближайшего 3-часового рубежа UTC (+10 сек задержки)"""
+    now = datetime.now(timezone.utc)
+    current_hour = now.hour
+    
+    # Ближайший следующий час, кратный 3 (03, 06, 09, 12, 15, 18, 21, 24)
+    next_hour = ((current_hour // 3) + 1) * 3
+    
+    if next_hour >= 24:
+        target_time = (now + timedelta(days=1)).replace(hour=0, minute=0, second=10, microsecond=0)
+    else:
+        target_time = now.replace(hour=next_hour, minute=0, second=10, microsecond=0)
+        
+    sleep_seconds = (target_time - now).total_seconds()
+    return max(sleep_seconds, 5)
+
 def analytics_scheduler_loop():
-    """Запускает анализ при старте и затем строго каждые 3 часа (10800 сек)"""
+    """Первичный запуск при старте, затем выравнивание по ровным 3-часовым меткам UTC"""
     time.sleep(3)
-    run_gold_analytics()  # Запуск при старте сервера
+    run_gold_analytics()  # Стартовый анализ
 
     while True:
-        # Пауза ровно 3 часа (10800 секунд)
-        time.sleep(10800)
+        sleep_time = get_seconds_until_next_3h_mark()
+        minutes_wait = round(sleep_time / 60, 1)
+        print(f"⏳ Ожидание {minutes_wait} мин. ({int(sleep_time)} сек.) до следующей 3H свечи (UTC)...")
+        time.sleep(sleep_time)
         run_gold_analytics()
 
 threading.Thread(target=analytics_scheduler_loop, daemon=True).start()
