@@ -213,7 +213,7 @@ def run_gold_analytics():
     print(f"[+] Аналитика завершена. Сигнал: {action} @ {curr_price}")
 
 # ------------------------------------------------------------------
-# РАСПИСАНИЕ XAUUSD (С 01:00 UTC И КАЖДЫЕ 3 ЧАСА)
+# РАСПИСАНИЕ XAUUSD (СТРОГО ПО МЕТКАМ ЧАСОВ В UTC)
 # UTC: 01:00, 04:00, 07:00, 10:00, 13:00, 16:00, 19:00, 22:00
 # MSK: 04:00, 07:00, 10:00, 13:00, 16:00, 19:00, 22:00, 01:00
 # ------------------------------------------------------------------
@@ -226,22 +226,16 @@ def get_seconds_until_next_3h_mark():
         if target_time > now_utc:
             return (target_time - now_utc).total_seconds()
 
-    # Если все метки на сегодня пройдены, следующая — 01:00:10 UTC завтра
+    # Следующая метка — 01:00:10 UTC завтра
     target_time = (now_utc + timedelta(days=1)).replace(hour=1, minute=0, second=10, microsecond=0)
     return (target_time - now_utc).total_seconds()
 
 def analytics_scheduler_loop():
-    """Первичный запуск при старте, затем выравнивание по сетке Золота"""
-    time.sleep(3)
-    
-    # Стартовый анализ при запуске (кроме субботы и воскресенья)
-    if datetime.now(timezone.utc).weekday() < 5:
-        run_gold_analytics()
-
+    """Синхронизированный цикл анализа без старта при запуске"""
     while True:
         sleep_time = get_seconds_until_next_3h_mark()
         hours_wait = round(sleep_time / 3600, 2)
-        print(f"⏳ Ожидание {hours_wait} ч. ({int(sleep_time)} сек.) до следующего 3H цикла Gold (UTC)...")
+        print(f"⏳ Ждём {hours_wait} ч. ({int(sleep_time)} сек.) до следующего планового анализа по расписанию...")
         
         time.sleep(sleep_time)
         
