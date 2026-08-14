@@ -81,30 +81,39 @@ def send_telegram(text):
         print(f"[-] Исключение при отправке в Telegram: {e}")
 
 # ------------------------------------------------------------------
-# ЗАГРУЗКА ДАННЫХ ИЗ TWELVEDATA API
+# ЗАГРУЗКА ДАННЫХ ИЗ TWELVEDATA API (С РЕТРАЯМИ И УВЕЛИЧЕННЫМ ТАЙМАУТОМ)
 # ------------------------------------------------------------------
-def fetch_tf_data(interval):
-    """Загрузка таймфрейма через TwelveData"""
-    try:
-        headers = {'User-Agent': 'Mozilla/5.0'}
-        url = f"https://api.twelvedata.com/time_series?symbol={SYMBOL}&interval={interval}&outputsize=40&apikey={TWELVE_DATA_API_KEY}"
-        
-        res = requests.get(url, headers=headers, timeout=10).json()
-        
-        if "values" not in res:
-            print(f"[-] Ошибка TwelveData на {interval}: {res.get('message', 'No values')}")
-            return interval, None
-        
-        df = pd.DataFrame(res["values"])
-        for col in ['open', 'high', 'low', 'close']:
-            df[col] = df[col].astype(float)
-        df.rename(columns={'open': 'Open', 'high': 'High', 'low': 'Low', 'close': 'Close'}, inplace=True)
-        # Разворачиваем порядок хронологически (от старых к новым)
-        df.iloc[:] = df.iloc[::-1].values
-        return interval, df
-    except Exception as e:
-        print(f"[-] Исключение при загрузке {interval}: {e}")
-        return interval, None
+def fetch_tf_data(interval, retries=3):
+    """Загрузка таймфрейма через TwelveData с повторными попытками при таймауте"""
+    url = f"https://api.twelvedata.com/time_series?symbol={SYMBOL}&interval={interval}&outputsize=40&apikey={TWELVE_DATA_API_KEY}"
+    headers = {'User-Agent': 'Mozilla/5.0'}
+
+    for attempt in range(1, retries + 1):
+        try:
+            # Увеличен таймаут: 5 сек подключение, 15 сек чтение
+            res = requests.get(url, headers=headers, timeout=(5, 15)).json()
+            
+            if "values" not in res:
+                print(f"[-] Ошибка TwelveData на {interval} (попытка {attempt}/{retries}): {res.get('message', 'No values')}")
+                if attempt < retries:
+                    time.sleep(2)
+                    continue
+                return interval, None
+            
+            df = pd.DataFrame(res["values"])
+            for col in ['open', 'high', 'low', 'close']:
+                df[col] = df[col].astype(float)
+            df.rename(columns={'open': 'Open', 'high': 'High', 'low': 'Low', 'close': 'Close'}, inplace=True)
+            # Разворачиваем порядок хронологически (от старых к новым)
+            df.iloc[:] = df.iloc[::-1].values
+            return interval, df
+
+        except Exception as e:
+            print(f"[-] Исключение при загрузке {interval} (попытка {attempt}/{retries}): {e}")
+            if attempt < retries:
+                time.sleep(2)
+
+    return interval, None
 
 def get_multi_tf_market_data():
     """Последовательная загрузка H4, H1 и M15"""
@@ -116,7 +125,7 @@ def get_multi_tf_market_data():
         if df is None:
             return None, None, None
         dfs[interval] = df
-        time.sleep(1.2) # Пауза 1.2 сек для защиты лимитов
+        time.sleep(1.2) # Пауза 1.2 сек для защиты лимитов API
 
     return dfs["4h"], dfs["1h"], dfs["15min"]
 
